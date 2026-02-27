@@ -15,7 +15,7 @@ The script:
 ## Files
 
 - **`llms_checker.py`**: The main Python script that does all the work.
-- **`domains.txt`** (optional/example): A simple text file where you list your domains.
+- **`domains.txt`** or **`domains.csv`** (optional/example): A simple text file/csv file where you list your domains.
 - **`llms_checker_workflow.md`**: This explanation file you are reading.
 
 ---
@@ -69,7 +69,7 @@ Rules:
 
 - The CSV must have a header row.
 - One of the columns must contain the domains (by default it is called `domain`).
-- You can rename that column and tell the script via `--domain-column`.
+- You can rename that column and tell the script via `--domain-column`(case-insensitive match).
 
 Example variations:
 
@@ -150,20 +150,23 @@ For all processed domains, it:
 
 - Counts the **total number of domains processed**.
 - Counts how many had `llms.txt`.
+- Counts HTTP 404/403.
 - Finds domains that **failed to check** (e.g. DNS error, timeout).
 
 Example style of output:
 
 ```text
-Total domains processed: 100
-Domains with llms.txt: 27
-Domains that failed to check (no response): 3
+Total domains processed: 40
+Domains with llms.txt: 34
+HTTP 404 Not Found: 5
+HTTP 403 Forbidden: 0
+Domains that failed to check (no response): 1
 
 Per-domain results:
 ------------------------------------------------------------
-example.com                   -> llms.txt: YES (HTTP 200)
-another-site.org              -> llms.txt: NO (HTTP 404)
-broken-domain.xyz             -> llms.txt: NO (error: [Errno 11001] getaddrinfo failed)
+example.com            -> llms.txt: NO (HTTP 404)
+www.anothersite.com    -> llms.txt: YES (HTTP 200)
+example2.com          -> llms.txt: NO (HTTP 404)
 
 Failed domains (unable to obtain):
 - broken-domain.xyz: [Errno 11001] getaddrinfo failed
@@ -174,6 +177,7 @@ This gives you:
 
 - How many domains are in the input.
 - How many were successfully checked and have `llms.txt`.
+- Distinguishing 403 Forbidden vs 404 Not Found
 - Which domains were **unable to obtain**, and **why**.
 
 ### 6. Writing a CSV (optional)
@@ -185,14 +189,15 @@ For the current workflow, the CSV is intentionally simple:
 - Columns:
   - `domain`
   - `contains_llms_txt` (`yes` / `no`)
-  - `details` (human-friendly explanation, including 403 vs 404 difference)
+  - `http_status`
+  - `details` (human-friendly explanation)
 
 Example output CSV:
 
 ```text
-domain,contains_llms_txt,details
-example.com,yes,Found (HTTP 2xx)
-another-site.org,no,HTTP 404 Not Found (llms.txt not present at that URL)
+domain,contains_llms_txt,http_status,details
+example.com,yes,200,Found (HTTP 2xx)
+another-site.org,no,404,HTTP 404 Not Found (llms.txt not present at that URL)
 ```
 
 The `details` column is designed to make the common “no” cases clearer:

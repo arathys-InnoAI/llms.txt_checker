@@ -177,12 +177,13 @@ def write_csv(results: List[DomainCheckResult], output_path: str) -> None:
 
     with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["domain", "contains_llms_txt", "details"])
+        writer.writerow(["domain", "contains_llms_txt", "http_status", "details"])
         for r in results:
             writer.writerow(
                 [
                     r.domain,
                     "yes" if r.has_llms_txt else "no",
+                    r.http_status if r.http_status is not None else "",
                     explain_status(r),
                 ]
             )

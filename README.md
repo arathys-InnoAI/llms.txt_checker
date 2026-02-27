@@ -91,9 +91,9 @@ If you pass an explicit name/path, that location is used instead.
 Output file format:
 
 ```text
-domain,contains_llms_txt,details
-example.com,yes
-another-site.org,no,HTTP 404 Not Found (llms.txt not present at that URL)
+domain,contains_llms_txt,http_status,details
+example.com,yes,200,Found (HTTP 2xx)
+another-site.org,no,404,HTTP 404 Not Found (llms.txt not present at that URL)
 ```
 
 The `details` column is especially useful to distinguish:
@@ -133,4 +133,3 @@ python llms_checker.py domains.csv --input-format csv --timeout 10 -o results.cs
 ## More detailed docs
 
 See `llms_checker_workflow.md` for the internal workflow/logic explanation.
-

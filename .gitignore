@@ -1,3 +1,6 @@
 domains.txt
 domains.csv
+results.csv
+results*.csv
 outputs/
+psw.txt
