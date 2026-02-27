@@ -1,6 +1,8 @@
 import argparse
 from dataclasses import dataclass
 from typing import List, Optional
+from pathlib import Path
+from datetime import datetime
 from urllib.parse import urlparse, urlunparse
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
@@ -127,13 +129,17 @@ def load_domains_from_csv(path: str, domain_column: str = "domain") -> List[str]
     domains: List[str] = []
     with open(path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
-        if domain_column not in (reader.fieldnames or []):
+        fieldnames = reader.fieldnames or []
+        # Make domain column matching more forgiving (case-insensitive).
+        fieldname_map = {name.lower(): name for name in fieldnames}
+        resolved_domain_column = fieldname_map.get(domain_column.lower())
+        if not resolved_domain_column:
             raise ValueError(
                 f"CSV file does not contain a '{domain_column}' column. "
-                f"Available columns: {', '.join(reader.fieldnames or [])}"
+                f"Available columns: {', '.join(fieldnames)}"
             )
         for row in reader:
-            raw = (row.get(domain_column) or "").strip()
+            raw = (row.get(resolved_domain_column) or "").strip()
             if not raw:
                 continue
             domains.append(raw)
@@ -148,16 +154,69 @@ def write_csv(results: List[DomainCheckResult], output_path: str) -> None:
     - domain
     - contains_llms_txt (yes/no)
     """
+    def explain_status(r: DomainCheckResult) -> str:
+        """
+        Human-friendly explanation of common outcomes.
+
+        Key difference:
+        - 404 Not Found: the server says the file/path doesn't exist.
+        - 403 Forbidden: the server understood the request but refuses access
+          (often bot blocking, IP restrictions, or authentication required).
+        """
+        if r.has_llms_txt:
+            return "Found (HTTP 2xx)"
+        if r.http_status == 404:
+            return "HTTP 404 Not Found (llms.txt not present at that URL)"
+        if r.http_status == 403:
+            return "HTTP 403 Forbidden (server refused access; may block bots/auth required)"
+        if r.http_status is not None:
+            return f"HTTP {r.http_status}"
+        if r.error:
+            return f"error: {r.error}"
+        return ""
+
     with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["domain", "contains_llms_txt"])
+        writer.writerow(["domain", "contains_llms_txt", "details"])
         for r in results:
             writer.writerow(
                 [
                     r.domain,
                     "yes" if r.has_llms_txt else "no",
+                    explain_status(r),
                 ]
             )
+
+
+def build_timestamped_output_path(filename: str = "results.csv") -> str:
+    """
+    Create an output path like: outputs/YYYYmmdd-HHMMSS/results.csv
+    Returns the full path as a string. Directory is created if needed.
+    """
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_dir = Path("outputs") / ts
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return str(out_dir / filename)
+
+
+def resolve_output_csv_path(output_csv_arg: str) -> str:
+    """
+    Interpret --output-csv argument.
+
+    Supported behaviors:
+    - If the value ends with .csv -> treat it as a file path.
+    - Otherwise -> treat it as a directory and write results.csv inside it.
+    """
+    p = Path(output_csv_arg)
+    if p.suffix.lower() == ".csv":
+        # Ensure parent directory exists (if any)
+        if p.parent and str(p.parent) not in (".", ""):
+            p.parent.mkdir(parents=True, exist_ok=True)
+        return str(p)
+
+    # Treat as directory
+    p.mkdir(parents=True, exist_ok=True)
+    return str(p / "results.csv")
 
 
 def print_summary(results: List[DomainCheckResult]) -> None:
@@ -166,10 +225,14 @@ def print_summary(results: List[DomainCheckResult]) -> None:
     """
     total_in_results = len(results)
     with_llms = sum(1 for r in results if r.has_llms_txt)
+    count_404 = sum(1 for r in results if r.http_status == 404)
+    count_403 = sum(1 for r in results if r.http_status == 403)
     failed = [r for r in results if r.error is not None and r.http_status is None]
 
     print(f"Total domains processed: {total_in_results}")
     print(f"Domains with llms.txt: {with_llms}")
+    print(f"HTTP 404 Not Found: {count_404}")
+    print(f"HTTP 403 Forbidden: {count_403}")
     print(f"Domains that failed to check (no response): {len(failed)}")
     print()
     print("Per-domain results:")
@@ -201,7 +264,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "-o",
         "--output-csv",
-        help="Optional path to write results as CSV.",
+        help=(
+            "Write results to CSV. Usage:\n"
+            "  - omit to not write a CSV\n"
+            "  - '-o' (no value) to write to outputs/<timestamp>/results.csv\n"
+            "  - '-o results.csv' to write to a specific file\n"
+            "  - '-o outputs' to write to outputs/results.csv"
+        ),
+        nargs="?",
+        const="__TIMESTAMPED__",
         default=None,
     )
     parser.add_argument(
@@ -258,9 +329,14 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if args.output_csv:
         try:
-            write_csv(results, args.output_csv)
+            if args.output_csv == "__TIMESTAMPED__":
+                output_path = build_timestamped_output_path("results.csv")
+            else:
+                output_path = resolve_output_csv_path(args.output_csv)
+
+            write_csv(results, output_path)
             print()
-            print(f"Results written to CSV: {args.output_csv}")
+            print(f"Results written to CSV: {output_path}")
         except Exception as e:
             print(f"Failed to write CSV file: {e}", file=sys.stderr)
 

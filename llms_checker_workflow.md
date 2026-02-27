@@ -94,7 +94,7 @@ The script has two loaders:
 
 - `load_domains_from_csv(path: str, domain_column: str = "domain") -> List[str>` for **CSV files**
   - Uses `csv.DictReader` to read the CSV.
-  - Checks that the header contains `domain_column`.
+  - Checks that the header contains `domain_column` (case-insensitive match).
   - Reads that column for each row, trims whitespace, ignores empty values.
   - Returns a list of domain strings.
 
@@ -185,14 +185,31 @@ For the current workflow, the CSV is intentionally simple:
 - Columns:
   - `domain`
   - `contains_llms_txt` (`yes` / `no`)
+  - `details` (human-friendly explanation, including 403 vs 404 difference)
 
 Example output CSV:
 
 ```text
-domain,contains_llms_txt
-example.com,yes
-another-site.org,no
+domain,contains_llms_txt,details
+example.com,yes,Found (HTTP 2xx)
+another-site.org,no,HTTP 404 Not Found (llms.txt not present at that URL)
 ```
+
+The `details` column is designed to make the common “no” cases clearer:
+
+- **HTTP 404 Not Found**: the server says the `llms.txt` path does not exist.
+- **HTTP 403 Forbidden**: the server understood the request but refuses access (often bot blocking, IP restrictions, or authentication required).
+
+### 7. Output file location (timestamped or explicit)
+
+The output location is controlled by `-o` / `--output-csv`:
+
+- If you **omit** `-o`, no CSV is written (console output only).
+- If you use **`-o` with no value**, the script writes to a timestamped folder:
+  - `outputs/<YYYYmmdd-HHMMSS>/results.csv`
+- If you pass a value:
+  - If it ends with `.csv`, it is treated as an explicit file path (example: `-o my_results.csv`).
+  - Otherwise it is treated as a directory (example: `-o output` writes `output/results.csv`).
 
 ---
 
@@ -218,7 +235,7 @@ Use whichever command works on your machine (`python` or `py`).
 
 #### Option A: Text file (`domains.txt`)
 
-In the same folder as `llms_checker.py`, create a file `domains.txt` with your ~100 domains.
+In the same folder as `llms_checker.py`, create a file `domains.txt` with your domains.
 
 Example:
 
@@ -228,10 +245,10 @@ mydomain.io
 https://already-with-scheme.net
 ```
 
-Run from `f:\Mightyllm`:
+Run from your repo path:
 
 ```powershell
-cd f:\Mightyllm
+cd <repo_path>
 python llms_checker.py domains.txt --input-format text
 ```
 
@@ -254,8 +271,8 @@ another-site.org,DE,2019,de
 Run:
 
 ```powershell
-cd f:\Mightyllm
-python llms_checker.py domains.csv --input-format csv --domain-column domain
+cd <repo_path>
+python llms_checker.py domains.csv --input-format csv
 ```
 
 If your column is named differently (e.g. `host`):
@@ -268,11 +285,25 @@ python llms_checker.py domains.csv --input-format csv --domain-column host
 
 Add the `-o` / `--output-csv` option (works with both text and CSV input):
 
+- Timestamped output folder:
+
+```powershell
+python llms_checker.py domains.csv --input-format csv --domain-column domain -o
+```
+
+- Explicit output file name:
+
 ```powershell
 python llms_checker.py domains.csv --input-format csv --domain-column domain -o results.csv
 ```
 
-This will:
+- Output directory (writes `output/results.csv`):
+
+```powershell
+python llms_checker.py domains.csv --input-format csv --domain-column domain -o output
+```
+
+These will:
 
 - Print the summary to the console, and
 - Write a simple results file: `domain,contains_llms_txt`.
