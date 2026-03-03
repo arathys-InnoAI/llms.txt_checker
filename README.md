@@ -92,16 +92,23 @@ Output file format:
 
 ```text
 domain,contains_llms_txt,http_status,details
-example.com,yes,200,Found (HTTP 2xx)
-another-site.org,no,404,HTTP 404 Not Found (llms.txt not present at that URL)
+example.com,yes,200,https://example.com/llms.txt -> HTTP 200 ; Found (HTTP 2xx)
+another-site.org,no,404,https://another-site.org/llms.txt -> HTTP 404 ; HTTP 404 Not Found (llms.txt not present at that URL)
 ```
 
 The `details` column is especially useful to distinguish:
 
 - **HTTP 404 Not Found**: the server says the file/path does not exist (most likely no `llms.txt`).
 - **HTTP 403 Forbidden**: the server understood the request but refuses access (often bot blocking, IP restrictions, or authentication required).
+- **HTTP 429 Too Many Requests**: you are being rate-limited (try `--delay`, and optionally `--retries` with backoff).
 
 ## Useful options
+
+- **Try both `domain.com` and `www.domain.com`** (default behavior) and disable if needed:
+
+```powershell
+python llms_checker.py domains.csv --input-format csv --no-www-fallback -o
+```
 
 - **Choose the output file name**:
 
@@ -121,6 +128,18 @@ This writes `output/results.csv`.
 
 ```powershell
 python llms_checker.py domains.csv --input-format csv --timeout 10 -o results.csv
+```
+
+- **Retries/backoff for transient blocks** (useful for 429/503/timeouts):
+
+```powershell
+python llms_checker.py domains.csv --input-format csv --timeout 15 --retries 2 --retry-wait 1 --backoff 2 -o
+```
+
+- **Polite delay between domains** (reduces rate-limits):
+
+```powershell
+python llms_checker.py domains.csv --input-format csv --delay 0.5 -o
 ```
 
 ## Notes / troubleshooting

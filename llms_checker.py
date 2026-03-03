@@ -1,13 +1,23 @@
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 from pathlib import Path
 from datetime import datetime
+import time
 from urllib.parse import urlparse, urlunparse
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 import csv
 import sys
+
+
+@dataclass
+class UrlAttempt:
+    url: str
+    http_status: Optional[int]
+    error: Optional[str]
+    content_type: Optional[str] = None
+    looks_like_html: bool = False
 
 
 @dataclass
@@ -17,6 +27,7 @@ class DomainCheckResult:
     has_llms_txt: bool
     http_status: Optional[int]
     error: Optional[str]
+    attempts: List[UrlAttempt] = field(default_factory=list)
 
 
 def normalize_domain(domain: str) -> str:
@@ -41,18 +52,151 @@ def build_llms_url(base_url: str) -> str:
     Given a base URL, construct the llms.txt URL.
     """
     parsed = urlparse(base_url)
-    path = parsed.path.rstrip("/")
-    path = f"{path}/llms.txt" if path else "/llms.txt"
-    return urlunparse(parsed._replace(path=path))
+    # llms.txt is typically served from the site root.
+    return urlunparse(parsed._replace(path="/llms.txt", query="", fragment=""))
 
 
-def check_single_domain(domain: str, timeout: float = 5.0) -> DomainCheckResult:
+def build_candidate_llms_urls(domain: str, try_www_variants: bool = True) -> List[str]:
+    """
+    Build one or more candidate llms.txt URLs to try.
+
+    By default, tries both:
+    - https://example.com/llms.txt
+    - https://www.example.com/llms.txt
+
+    If the input already contains www, it will also try the non-www variant.
+    """
+    base_url = normalize_domain(domain)
+    if not base_url:
+        return []
+
+    parsed = urlparse(base_url)
+    scheme = parsed.scheme or "https"
+    host = parsed.netloc
+    if not host:
+        return []
+
+    hosts: List[str] = [host]
+    if try_www_variants:
+        if host.lower().startswith("www."):
+            hosts.append(host[4:])
+        else:
+            hosts.append(f"www.{host}")
+
+    # Deduplicate while preserving order
+    seen = set()
+    out: List[str] = []
+    for h in hosts:
+        if not h or h.lower() in seen:
+            continue
+        seen.add(h.lower())
+        out.append(urlunparse((scheme, h, "/llms.txt", "", "", "")))
+    return out
+
+
+def fetch_with_retries(
+    url: str,
+    timeout: float,
+    retries: int,
+    retry_wait_s: float,
+    backoff_factor: float,
+) -> List[UrlAttempt]:
+    """
+    Fetch a URL with retry/backoff behavior.
+
+    Retries apply to:
+    - transient HTTP statuses: 429 and 5xx
+    - timeouts / connection errors
+    """
+    max_attempts = max(1, 1 + retries)
+    attempts: List[UrlAttempt] = []
+
+    transient_statuses = {429, 500, 502, 503, 504}
+
+    for attempt_idx in range(1, max_attempts + 1):
+        req = Request(url, method="GET", headers={"User-Agent": "llms-checker/1.0"})
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                status = resp.getcode()
+
+                # Read a small sample of the body to distinguish real text files
+                # from generic HTML "page not found" responses.
+                body_sample = resp.read(4096) or b""
+                content_type = resp.headers.get("Content-Type", None)
+                lower_sample = body_sample.lower()
+                looks_like_html = b"<html" in lower_sample or b"<!doctype html" in lower_sample
+
+                attempts.append(
+                    UrlAttempt(
+                        url=url,
+                        http_status=status,
+                        error=None,
+                        content_type=content_type,
+                        looks_like_html=looks_like_html,
+                    )
+                )
+                if status in transient_statuses and attempt_idx < max_attempts:
+                    wait = retry_wait_s * (backoff_factor ** (attempt_idx - 1))
+                    time.sleep(wait)
+                    continue
+                return attempts
+        except HTTPError as e:
+            status = e.code
+            attempts.append(
+                UrlAttempt(url=url, http_status=status, error=str(e), content_type=None, looks_like_html=False)
+            )
+            if status in transient_statuses and attempt_idx < max_attempts:
+                wait = retry_wait_s * (backoff_factor ** (attempt_idx - 1))
+                time.sleep(wait)
+                continue
+            return attempts
+        except URLError as e:
+            attempts.append(
+                UrlAttempt(
+                    url=url,
+                    http_status=None,
+                    error=str(e.reason),
+                    content_type=None,
+                    looks_like_html=False,
+                )
+            )
+            if attempt_idx < max_attempts:
+                wait = retry_wait_s * (backoff_factor ** (attempt_idx - 1))
+                time.sleep(wait)
+                continue
+            return attempts
+        except Exception as e:  # Catch-all to avoid script crash on weird cases
+            attempts.append(
+                UrlAttempt(
+                    url=url,
+                    http_status=None,
+                    error=str(e),
+                    content_type=None,
+                    looks_like_html=False,
+                )
+            )
+            if attempt_idx < max_attempts:
+                wait = retry_wait_s * (backoff_factor ** (attempt_idx - 1))
+                time.sleep(wait)
+                continue
+            return attempts
+
+    return attempts
+
+
+def check_single_domain(
+    domain: str,
+    timeout: float = 5.0,
+    try_www_variants: bool = True,
+    retries: int = 0,
+    retry_wait_s: float = 1.0,
+    backoff_factor: float = 2.0,
+) -> DomainCheckResult:
     """
     Check if a single domain exposes /llms.txt.
     Tries HTTPS first (if no scheme given).
     """
-    base_url = normalize_domain(domain)
-    if not base_url:
+    if not domain.strip():
         return DomainCheckResult(
             domain=domain,
             url_checked="",
@@ -61,48 +205,71 @@ def check_single_domain(domain: str, timeout: float = 5.0) -> DomainCheckResult:
             error="empty_domain",
         )
 
-    llms_url = build_llms_url(base_url)
+    candidate_urls = build_candidate_llms_urls(domain, try_www_variants=try_www_variants)
+    if not candidate_urls:
+        return DomainCheckResult(
+            domain=domain,
+            url_checked="",
+            has_llms_txt=False,
+            http_status=None,
+            error="invalid_domain_or_url",
+        )
 
-    req = Request(llms_url, method="GET", headers={"User-Agent": "llms-checker/1.0"})
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            status = resp.getcode()
-            # Treat any 2xx as "exists"
-            has_llms = 200 <= status < 300
-            return DomainCheckResult(
-                domain=domain,
-                url_checked=llms_url,
-                has_llms_txt=has_llms,
-                http_status=status,
-                error=None,
-            )
-    except HTTPError as e:
-        # HTTPError is also a response; we can inspect the status code.
-        status = e.code
-        has_llms = 200 <= status < 300
-        return DomainCheckResult(
-            domain=domain,
-            url_checked=llms_url,
-            has_llms_txt=has_llms,
-            http_status=status,
-            error=str(e) if not has_llms else None,
+    all_attempts: List[UrlAttempt] = []
+
+    for url in candidate_urls:
+        attempts = fetch_with_retries(
+            url=url,
+            timeout=timeout,
+            retries=retries,
+            retry_wait_s=retry_wait_s,
+            backoff_factor=backoff_factor,
         )
-    except URLError as e:
-        return DomainCheckResult(
-            domain=domain,
-            url_checked=llms_url,
-            has_llms_txt=False,
-            http_status=None,
-            error=str(e.reason),
-        )
-    except Exception as e:  # Catch-all to avoid script crash on weird cases
-        return DomainCheckResult(
-            domain=domain,
-            url_checked=llms_url,
-            has_llms_txt=False,
-            http_status=None,
-            error=str(e),
-        )
+        all_attempts.extend(attempts)
+
+        # Stop early if any attempt clearly succeeded with a real llms.txt
+        for a in attempts:
+            if a.http_status is not None and 200 <= a.http_status < 300:
+                # Heuristic: treat as llms.txt only if it doesn't look like HTML
+                # and the content type is text-like or unspecified.
+                ct = (a.content_type or "").lower()
+                if a.looks_like_html:
+                    continue
+                if ct and not ct.startswith("text/") and "llms" not in ct:
+                    continue
+                return DomainCheckResult(
+                    domain=domain,
+                    url_checked=a.url,
+                    has_llms_txt=True,
+                    http_status=a.http_status,
+                    error=None,
+                    attempts=all_attempts,
+                )
+
+    statuses = [a.http_status for a in all_attempts if a.http_status is not None]
+    errors = [a.error for a in all_attempts if a.error]
+
+    # Prefer "blocked" classification if we saw any 403; else fall back to 404; else last status.
+    final_status: Optional[int] = None
+    if 403 in statuses:
+        final_status = 403
+    elif 404 in statuses:
+        final_status = 404
+    elif statuses:
+        final_status = statuses[-1]
+
+    final_error: Optional[str] = None
+    if final_status is None and errors:
+        final_error = errors[-1]
+
+    return DomainCheckResult(
+        domain=domain,
+        url_checked=all_attempts[-1].url if all_attempts else "",
+        has_llms_txt=False,
+        http_status=final_status,
+        error=final_error,
+        attempts=all_attempts,
+    )
 
 
 def load_domains(path: str) -> List[str]:
@@ -163,17 +330,41 @@ def write_csv(results: List[DomainCheckResult], output_path: str) -> None:
         - 403 Forbidden: the server understood the request but refuses access
           (often bot blocking, IP restrictions, or authentication required).
         """
+        parts: List[str] = []
+
+        if r.attempts:
+            per_url: List[str] = []
+            for a in r.attempts:
+                if a.http_status is not None:
+                    suffix = ""
+                    if a.looks_like_html:
+                        suffix = " (body looks like HTML)"
+                    per_url.append(f"{a.url} -> HTTP {a.http_status}{suffix}")
+                elif a.error:
+                    per_url.append(f"{a.url} -> error: {a.error}")
+            if per_url:
+                parts.append(" | ".join(per_url))
+
         if r.has_llms_txt:
-            return "Found (HTTP 2xx)"
+            parts.append("Found (HTTP 2xx)")
+            return " ; ".join(parts) if parts else "Found (HTTP 2xx)"
+
         if r.http_status == 404:
-            return "HTTP 404 Not Found (llms.txt not present at that URL)"
-        if r.http_status == 403:
-            return "HTTP 403 Forbidden (server refused access; may block bots/auth required)"
-        if r.http_status is not None:
-            return f"HTTP {r.http_status}"
-        if r.error:
-            return f"error: {r.error}"
-        return ""
+            parts.append("HTTP 404 Not Found (llms.txt not present at that URL)")
+        elif r.http_status == 403:
+            parts.append(
+                "HTTP 403 Forbidden (server refused access; may block bots/auth required)"
+            )
+        elif r.http_status == 429:
+            parts.append(
+                "HTTP 429 Too Many Requests (rate limited; try --delay and/or retries)"
+            )
+        elif r.http_status is not None:
+            parts.append(f"HTTP {r.http_status}")
+        elif r.error:
+            parts.append(f"error: {r.error}")
+
+        return " ; ".join(parts)
 
     with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
@@ -226,14 +417,29 @@ def print_summary(results: List[DomainCheckResult]) -> None:
     """
     total_in_results = len(results)
     with_llms = sum(1 for r in results if r.has_llms_txt)
-    count_404 = sum(1 for r in results if r.http_status == 404)
-    count_403 = sum(1 for r in results if r.http_status == 403)
+    # Domain-level (final classification)
+    count_domain_404 = sum(1 for r in results if r.http_status == 404)
+    count_domain_403 = sum(1 for r in results if r.http_status == 403)
+    count_domain_429 = sum(1 for r in results if r.http_status == 429)
+
+    # Request-level (all HTTP responses across retries + www/non-www)
+    count_http_404 = sum(
+        1 for r in results for a in r.attempts if a.http_status == 404
+    )
+    count_http_403 = sum(
+        1 for r in results for a in r.attempts if a.http_status == 403
+    )
+    count_http_429 = sum(1 for r in results for a in r.attempts if a.http_status == 429)
     failed = [r for r in results if r.error is not None and r.http_status is None]
 
     print(f"Total domains processed: {total_in_results}")
     print(f"Domains with llms.txt: {with_llms}")
-    print(f"HTTP 404 Not Found: {count_404}")
-    print(f"HTTP 403 Forbidden: {count_403}")
+    print(f"Domain result = HTTP 404 Not Found: {count_domain_404}")
+    print(f"Domain result = HTTP 403 Forbidden: {count_domain_403}")
+    print(f"Domain result = HTTP 429 Too Many Requests: {count_domain_429}")
+    #print(f"HTTP 404 responses (all requests): {count_http_404}")
+    #print(f"HTTP 403 responses (all requests): {count_http_403}")
+    #print(f"HTTP 429 responses (all requests): {count_http_429}")
     print(f"Domains that failed to check (no response): {len(failed)}")
     print()
     print("Per-domain results:")
@@ -283,6 +489,35 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Timeout in seconds for each HTTP request (default: 5.0).",
     )
     parser.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="Number of retries per URL for transient failures (default: 0).",
+    )
+    parser.add_argument(
+        "--retry-wait",
+        type=float,
+        default=1.0,
+        help="Base wait time (seconds) before retrying (default: 1.0).",
+    )
+    parser.add_argument(
+        "--backoff",
+        type=float,
+        default=2.0,
+        help="Exponential backoff factor for retries (default: 2.0).",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.0,
+        help="Delay (seconds) between domains to reduce rate-limits (default: 0).",
+    )
+    parser.add_argument(
+        "--no-www-fallback",
+        action="store_true",
+        help="Do not try www/non-www variants (default: try both).",
+    )
+    parser.add_argument(
         "--input-format",
         choices=["text", "csv"],
         default="text",
@@ -322,9 +557,19 @@ def main(argv: Optional[List[str]] = None) -> None:
         sys.exit(1)
 
     results: List[DomainCheckResult] = []
-    for d in domains:
-        result = check_single_domain(d, timeout=args.timeout)
+    for idx, d in enumerate(domains):
+        result = check_single_domain(
+            d,
+            timeout=args.timeout,
+            try_www_variants=not args.no_www_fallback,
+            retries=max(0, args.retries),
+            retry_wait_s=max(0.0, args.retry_wait),
+            backoff_factor=max(1.0, args.backoff),
+        )
         results.append(result)
+
+        if args.delay > 0 and idx < (len(domains) - 1):
+            time.sleep(args.delay)
 
     print_summary(results)
 

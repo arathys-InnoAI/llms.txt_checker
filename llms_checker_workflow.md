@@ -126,13 +126,15 @@ Function: `check_single_domain(domain: str, timeout: float = 5.0) -> DomainCheck
 For each input domain:
 
 1. Normalize it to a base URL.
-2. Build the corresponding `llms.txt` URL.
-3. Make an HTTP GET request to that URL with a configurable timeout (default 5 seconds).
+2. Build one or more candidate `llms.txt` URLs (by default it tries both non-`www` and `www`).
+3. Make an HTTP GET request to each candidate URL with a configurable timeout (default 5 seconds).
+4. Optionally retry with exponential backoff for transient failures (429/5xx/timeouts).
 4. Capture:
    - The **final URL** that was checked
    - The **HTTP status code** (if any)
    - Whether `llms.txt` **exists** (2xx status)
    - Any **error message** (connection issues, DNS failure, etc.)
+   - The list of URLs attempted (used for reporting)
 
 It returns a `DomainCheckResult` data object that holds:
 
@@ -189,21 +191,29 @@ For the current workflow, the CSV is intentionally simple:
 - Columns:
   - `domain`
   - `contains_llms_txt` (`yes` / `no`)
-  - `http_status`
-  - `details` (human-friendly explanation)
+  - `http_status` (final status chosen for the domain, if any)
+  - `details` (human-friendly explanation, including per-URL outcomes)
 
 Example output CSV:
 
 ```text
 domain,contains_llms_txt,http_status,details
-example.com,yes,200,Found (HTTP 2xx)
-another-site.org,no,404,HTTP 404 Not Found (llms.txt not present at that URL)
+example.com,yes,200,https://example.com/llms.txt -> HTTP 200 ; Found (HTTP 2xx)
+another-site.org,no,404,https://another-site.org/llms.txt -> HTTP 404 ; HTTP 404 Not Found (llms.txt not present at that URL)
 ```
 
 The `details` column is designed to make the common “no” cases clearer:
 
 - **HTTP 404 Not Found**: the server says the `llms.txt` path does not exist.
 - **HTTP 403 Forbidden**: the server understood the request but refuses access (often bot blocking, IP restrictions, or authentication required).
+- **HTTP 429 Too Many Requests**: the server is rate limiting you; add `--delay` and consider retries/backoff.
+
+It will also include the outcomes of attempts such as trying both:
+
+- `https://domain.com/llms.txt`
+- `https://www.domain.com/llms.txt`
+
+This helps distinguish “true 404” from “blocked on one host but found on the other”.
 
 ### 7. Output file location (timestamped or explicit)
 
@@ -215,6 +225,15 @@ The output location is controlled by `-o` / `--output-csv`:
 - If you pass a value:
   - If it ends with `.csv`, it is treated as an explicit file path (example: `-o my_results.csv`).
   - Otherwise it is treated as a directory (example: `-o output` writes `output/results.csv`).
+
+### 8. Improving accuracy with retries and delays
+
+Some sites return `403`, `429`, or time out due to bot protection or rate limiting. You can often improve results by:
+
+- Increasing timeout: `--timeout 15`
+- Adding retries/backoff: `--retries 2 --retry-wait 1 --backoff 2`
+- Adding a small delay between domains: `--delay 0.5`
+- Disabling `www` fallback if you want only one host: `--no-www-fallback`
 
 ---
 
