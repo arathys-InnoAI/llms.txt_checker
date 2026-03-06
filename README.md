@@ -148,6 +148,7 @@ python llms_checker.py domains.csv --input-format csv --delay 0.5 -o
 - **403 / auth issues while pushing this repo**: unrelated to script usage; it’s GitHub permissions/authentication.
 - **Some sites block bots**: servers may return `403` or other statuses even if the file exists for browsers.
 - **Network failures** (DNS errors, timeouts) are listed under “Failed domains (unable to obtain)” in the console output.
+- **status 200 : html**: if the http_status is 200, but doesnt contain an .txt file it will return no
 
 ## More detailed docs
 
